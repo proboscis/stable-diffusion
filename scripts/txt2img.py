@@ -1,31 +1,31 @@
-import argparse, os, sys, glob
-import cv2
-import torch
-import numpy as np
-from omegaconf import OmegaConf
-from PIL import Image
-from tqdm import tqdm, trange
-from imwatermark import WatermarkEncoder
-from itertools import islice
-from einops import rearrange
-from torchvision.utils import make_grid
+import argparse
+import os
 import time
+from contextlib import nullcontext
+from dataclasses import dataclass
+from itertools import islice
+
+import cv2
+import numpy as np
+import torch
+from PIL import Image
+from einops import rearrange
+from imwatermark import WatermarkEncoder
+from omegaconf import OmegaConf
 from pytorch_lightning import seed_everything
 from torch import autocast
-from contextlib import contextmanager, nullcontext
+from torchvision.utils import make_grid
+from tqdm import tqdm, trange
+from transformers import AutoFeatureExtractor
 
-from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
-
-from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
-from transformers import AutoFeatureExtractor
+from ldm.util import instantiate_from_config
+from ray_jobs.ray_design import ray_design
+import ray
 
 
 # load safety model
-safety_model_id = "CompVis/stable-diffusion-safety-checker"
-safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
-safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
 
 
 def chunk(it, size):
@@ -77,24 +77,14 @@ def load_replacement(x):
     try:
         hwc = x.shape
         y = Image.open("assets/rick.jpeg").convert("RGB").resize((hwc[1], hwc[0]))
-        y = (np.array(y)/255.0).astype(x.dtype)
+        y = (np.array(y) / 255.0).astype(x.dtype)
         assert y.shape == x.shape
         return y
     except Exception:
         return x
 
 
-def check_safety(x_image):
-    safety_checker_input = safety_feature_extractor(numpy_to_pil(x_image), return_tensors="pt")
-    x_checked_image, has_nsfw_concept = safety_checker(images=x_image, clip_input=safety_checker_input.pixel_values)
-    assert x_checked_image.shape[0] == len(has_nsfw_concept)
-    for i in range(len(has_nsfw_concept)):
-        if has_nsfw_concept[i]:
-            x_checked_image[i] = load_replacement(x_checked_image[i])
-    return x_checked_image, has_nsfw_concept
-
-
-def main():
+def parse_args():
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
@@ -227,6 +217,199 @@ def main():
         default="autocast"
     )
     opt = parser.parse_args()
+    return opt
+
+
+# TODO make this an actor that serves. => took 1 hour.
+
+
+@dataclass
+class Txt2Img:
+    opt: argparse.Namespace
+    enable_safety_check: bool
+
+    def __post_init__(self):
+        opt = self.opt
+        os.chdir("../stable-diffusion")
+        from diffusers.pipelines.stable_diffusion import StableDiffusionSafetyChecker
+        safety_model_id = "CompVis/stable-diffusion-safety-checker"
+        self.safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
+        self.safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
+
+        seed_everything(opt.seed)
+        if opt.laion400m:
+            print("Falling back to LAION 400M model...")
+            opt.config = "configs/latent-diffusion/txt2img-1p4B-eval.yaml"
+            opt.ckpt = "models/ldm/text2img-large/model.ckpt"
+            opt.outdir = "outputs/txt2img-samples-laion400m"
+        config = OmegaConf.load(f"{opt.config}")
+        self.device, self.model = self.setup_model(config, opt)
+        self.sampler = self.get_sampler(self.model, opt)
+        self.batch_size = opt.n_samples
+        print("Creating invisible watermark encoder (see https://github.com/ShieldMnt/invisible-watermark)...")
+        wm = "StableDiffusionV1"
+        self.wm_encoder = WatermarkEncoder()
+        self.wm_encoder.set_watermark('bytes', wm.encode('utf-8'))
+        self.outpath = opt.outdir
+        os.makedirs(opt.outdir, exist_ok=True)
+        self.sample_path = os.path.join(self.outpath, "samples")
+        os.makedirs(self.sample_path, exist_ok=True)
+        self.base_count = len(os.listdir(self.sample_path))
+        self.grid_count = len(os.listdir(self.outpath)) - 1
+        self.n_rows = opt.n_rows if opt.n_rows > 0 else self.batch_size
+        print("txt2img model is ready")
+
+    def generate_images(self, prompt, start_code=None):
+        precision_scope = autocast if opt.precision == "autocast" else nullcontext
+        prompt = self.batch_size * [prompt]
+        with torch.no_grad():
+            with precision_scope("cuda"):
+                with self.model.ema_scope():
+                    all_samples = list()
+                    for n in trange(opt.n_iter, desc="Sampling"):
+                        images_torch = self.generate_from_prompt(prompt, start_code)
+
+                        for x_sample in images_torch:
+                            sample_img = self.sample_to_img(x_sample)
+                            if not opt.skip_save:
+                                self.save_sample(sample_img)
+
+                        if not opt.skip_grid:
+                            all_samples.append(images_torch)
+
+                    grid_image = self.to_grid_img(all_samples)
+                    if not opt.skip_grid:
+                        # additionally, save as grid
+                        self.save_grid(grid_image)
+        print(f"Your samples are ready and waiting for you here: \n{self.outpath} \n"
+              f" \nEnjoy.")
+
+    def generate_grid(self, prompt, start_code=None):
+        precision_scope = autocast if opt.precision == "autocast" else nullcontext
+        prompt = self.batch_size * [prompt]
+        with torch.no_grad():
+            with precision_scope("cuda"):
+                with self.model.ema_scope():
+                    all_samples = list()
+                    for n in trange(opt.n_iter, desc="Sampling"):
+                        images_torch = self.generate_from_prompt(prompt, start_code)
+                        for x_sample in images_torch:
+                            sample_img = self.sample_to_img(x_sample)
+                            self.save_sample(sample_img)
+                        all_samples.append(images_torch)
+                    grid_image = self.to_grid_img(all_samples)
+                    self.save_grid(grid_image)
+                    return grid_image
+
+    def generate_samples(self, prompt, start_code=None):
+        precision_scope = autocast if opt.precision == "autocast" else nullcontext
+        prompt = self.batch_size * [prompt]
+        with torch.no_grad():
+            with precision_scope("cuda"):
+                with self.model.ema_scope():
+                    all_samples = list()
+                    for n in trange(opt.n_iter, desc="Sampling"):
+                        images_torch = self.generate_from_prompt(prompt, start_code)
+                        for x_sample in images_torch:
+                            sample_img = self.sample_to_img(x_sample)
+                            all_samples.append(sample_img)
+        return all_samples
+
+    def generate_from_prompt(self, prompts, start_code=None, uc=None):
+        if opt.fixed_code:
+            start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=self.device)
+        if opt.scale != 1.0:
+            uc = self.model.get_learned_conditioning(self.batch_size * [""])
+        if isinstance(prompts, tuple):
+            prompts = list(prompts)
+        c = self.model.get_learned_conditioning(prompts)
+        shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
+        samples_ddim, _ = self.sampler.sample(S=opt.ddim_steps,
+                                              conditioning=c,
+                                              batch_size=opt.n_samples,
+                                              shape=shape,
+                                              verbose=False,
+                                              unconditional_guidance_scale=opt.scale,
+                                              unconditional_conditioning=uc,
+                                              eta=opt.ddim_eta,
+                                              x_T=start_code)
+        x_samples_ddim = self.model.decode_first_stage(samples_ddim)
+        x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+        if self.enable_safety_check:
+            x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
+            x_checked_image, has_nsfw_concept = self.check_safety(x_samples_ddim)
+            images_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
+        else:
+            images_torch = x_samples_ddim
+        return images_torch
+
+    def save_sample(self, img):
+        img.save(os.path.join(self.sample_path, f"{self.base_count:05}.png"))
+        self.base_count += 1
+
+    def sample_to_img(self, x_sample):
+        x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
+        img = Image.fromarray(x_sample.astype(np.uint8))
+        img = put_watermark(img, self.wm_encoder)
+        return img
+
+    def save_grid(self, img):
+        img.save(os.path.join(self.outpath, f'grid-{self.grid_count:04}.png'))
+        self.grid_count += 1
+
+    def to_grid_img(self, all_samples):
+        grid = torch.stack(all_samples, 0)
+        grid = rearrange(grid, 'n b c h w -> (n b) c h w')
+        grid = make_grid(grid, nrow=self.n_rows)
+        # to image
+        grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
+        img = Image.fromarray(grid.astype(np.uint8))
+        img = put_watermark(img, self.wm_encoder)
+        return img
+
+    def get_sampler(self, model, opt):
+        if opt.plms:
+            sampler = PLMSSampler(model)
+        else:
+            sampler = DDIMSampler(model)
+        return sampler
+
+    def setup_model(self, config, opt):
+        model = load_model_from_config(config, f"{opt.ckpt}")
+        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        model = model.to(device)
+        return device, model
+
+    def check_safety(self, x_image):
+        safety_checker_input = self.safety_feature_extractor(numpy_to_pil(x_image), return_tensors="pt")
+        x_checked_image, has_nsfw_concept = self.safety_checker(images=x_image,
+                                                                clip_input=safety_checker_input.pixel_values)
+        assert x_checked_image.shape[0] == len(has_nsfw_concept)
+        for i in range(len(has_nsfw_concept)):
+            if has_nsfw_concept[i]:
+                x_checked_image[i] = load_replacement(x_checked_image[i])
+        return x_checked_image, has_nsfw_concept
+
+    def __repr__(self):
+        return f"Txt2Img"
+
+
+def main(opt):
+    import os
+    os.chdir("../stable-diffusion")
+    from diffusers.pipelines.stable_diffusion import StableDiffusionSafetyChecker
+    safety_model_id = "CompVis/stable-diffusion-safety-checker"
+    safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
+    safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
+
+    def check_safety(x_image):
+        safety_checker_input = safety_feature_extractor(numpy_to_pil(x_image), return_tensors="pt")
+        x_checked_image, has_nsfw_concept = safety_checker(images=x_image, clip_input=safety_checker_input.pixel_values)
+        assert x_checked_image.shape[0] == len(has_nsfw_concept)
+        for i in range(len(has_nsfw_concept)):
+            if has_nsfw_concept[i]:
+                x_checked_image[i] = load_replacement(x_checked_image[i])
+        return x_checked_image, has_nsfw_concept
 
     if opt.laion400m:
         print("Falling back to LAION 400M model...")
@@ -277,7 +460,7 @@ def main():
     if opt.fixed_code:
         start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=device)
 
-    precision_scope = autocast if opt.precision=="autocast" else nullcontext
+    precision_scope = autocast if opt.precision == "autocast" else nullcontext
     with torch.no_grad():
         with precision_scope("cuda"):
             with model.ema_scope():
@@ -340,5 +523,14 @@ def main():
           f" \nEnjoy.")
 
 
+Txt2ImgActor = ray.remote(Txt2Img).options(num_gpus=1, name="txt2img", get_if_exists=True)
+
 if __name__ == "__main__":
-    main()
+    ray_design.bind_instance(
+    ).provide("ray")
+    opt = parse_args()
+    txt2img = Txt2ImgActor.remote(opt, False)
+    while True:
+        print("serving txt2img actor..")
+        time.sleep(10000)
+    # ray.get(ray.remote(main).options(num_gpus=1).remote(opt))
