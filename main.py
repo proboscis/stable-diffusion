@@ -415,7 +415,41 @@ class CUDACallback(Callback):
             pass
 
 
-if __name__ == "__main__":
+def setup_resume(now, opt):
+    if opt.resume:
+        if not os.path.exists(opt.resume):
+            raise ValueError("Cannot find {}".format(opt.resume))
+        if os.path.isfile(opt.resume):
+            paths = opt.resume.split("/")
+            # idx = len(paths)-paths[::-1].index("logs")+1
+            # logdir = "/".join(paths[:idx])
+            logdir = "/".join(paths[:-2])
+            ckpt = opt.resume
+        else:
+            assert os.path.isdir(opt.resume), opt.resume
+            logdir = opt.resume.rstrip("/")
+            ckpt = os.path.join(logdir, "checkpoints", "last.ckpt")
+
+        opt.resume_from_checkpoint = ckpt
+        base_configs = sorted(glob.glob(os.path.join(logdir, "configs/*.yaml")))
+        opt.base = base_configs + opt.base
+        _tmp = logdir.split("/")
+        nowname = _tmp[-1]
+    else:
+        if opt.name:
+            name = "_" + opt.name
+        elif opt.base:
+            cfg_fname = os.path.split(opt.base[0])[-1]
+            cfg_name = os.path.splitext(cfg_fname)[0]
+            name = "_" + cfg_name
+        else:
+            name = ""
+        nowname = now + name + opt.postfix
+        logdir = os.path.join(opt.logdir, nowname)
+    return logdir, ckpt, nowname
+
+
+def main():
     # custom parser to specify config files, train, test and debug mode,
     # postfix, resume.
     # `--key value` arguments are interpreted as arguments to the trainer.
@@ -474,36 +508,7 @@ if __name__ == "__main__":
             "If you want to resume training in a new log folder, "
             "use -n/--name in combination with --resume_from_checkpoint"
         )
-    if opt.resume:
-        if not os.path.exists(opt.resume):
-            raise ValueError("Cannot find {}".format(opt.resume))
-        if os.path.isfile(opt.resume):
-            paths = opt.resume.split("/")
-            # idx = len(paths)-paths[::-1].index("logs")+1
-            # logdir = "/".join(paths[:idx])
-            logdir = "/".join(paths[:-2])
-            ckpt = opt.resume
-        else:
-            assert os.path.isdir(opt.resume), opt.resume
-            logdir = opt.resume.rstrip("/")
-            ckpt = os.path.join(logdir, "checkpoints", "last.ckpt")
-
-        opt.resume_from_checkpoint = ckpt
-        base_configs = sorted(glob.glob(os.path.join(logdir, "configs/*.yaml")))
-        opt.base = base_configs + opt.base
-        _tmp = logdir.split("/")
-        nowname = _tmp[-1]
-    else:
-        if opt.name:
-            name = "_" + opt.name
-        elif opt.base:
-            cfg_fname = os.path.split(opt.base[0])[-1]
-            cfg_name = os.path.splitext(cfg_fname)[0]
-            name = "_" + cfg_name
-        else:
-            name = ""
-        nowname = now + name + opt.postfix
-        logdir = os.path.join(opt.logdir, nowname)
+    logdir, ckpt, opt, nowname = setup_resume(now, opt)
 
     ckptdir = os.path.join(logdir, "checkpoints")
     cfgdir = os.path.join(logdir, "configs")
@@ -511,153 +516,19 @@ if __name__ == "__main__":
 
     try:
         # init and save configs
+        # what a spaghetti, we cant tell what depend on the other...
         configs = [OmegaConf.load(cfg) for cfg in opt.base]
         cli = OmegaConf.from_dotlist(unknown)
         config = OmegaConf.merge(*configs, cli)
-        lightning_config = config.pop("lightning", OmegaConf.create())
-        # merge trainer cli with config
-        trainer_config = lightning_config.get("trainer", OmegaConf.create())
-        # default to ddp
-        trainer_config["accelerator"] = "ddp"
-        for k in nondefault_trainer_args(opt):
-            trainer_config[k] = getattr(opt, k)
-        if not "gpus" in trainer_config:
-            del trainer_config["accelerator"]
-            cpu = True
-        else:
-            gpuinfo = trainer_config["gpus"]
-            print(f"Running on GPUs {gpuinfo}")
-            cpu = False
-        trainer_opt = argparse.Namespace(**trainer_config)
-        lightning_config.trainer = trainer_config
 
-        # model
         model = instantiate_from_config(config.model)
 
+        cpu, lightning_config, trainer_opt = get_lightning_trainer_cfg(config, opt)
+
+        # model
+
         # trainer and callbacks
-        trainer_kwargs = dict()
-
-        # default logger configs
-        default_logger_cfgs = {
-            "wandb": {
-                "target": "pytorch_lightning.loggers.WandbLogger",
-                "params": {
-                    "name": nowname,
-                    "save_dir": logdir,
-                    "offline": opt.debug,
-                    "id": nowname,
-                }
-            },
-            "testtube": {
-                "target": "pytorch_lightning.loggers.TestTubeLogger",
-                "params": {
-                    "name": "testtube",
-                    "save_dir": logdir,
-                }
-            },
-        }
-        default_logger_cfg = default_logger_cfgs["testtube"]
-        if "logger" in lightning_config:
-            logger_cfg = lightning_config.logger
-        else:
-            logger_cfg = OmegaConf.create()
-        logger_cfg = OmegaConf.merge(default_logger_cfg, logger_cfg)
-        trainer_kwargs["logger"] = instantiate_from_config(logger_cfg)
-
-        # modelcheckpoint - use TrainResult/EvalResult(checkpoint_on=metric) to
-        # specify which metric is used to determine best models
-        default_modelckpt_cfg = {
-            "target": "pytorch_lightning.callbacks.ModelCheckpoint",
-            "params": {
-                "dirpath": ckptdir,
-                "filename": "{epoch:06}",
-                "verbose": True,
-                "save_last": True,
-            }
-        }
-        if hasattr(model, "monitor"):
-            print(f"Monitoring {model.monitor} as checkpoint metric.")
-            default_modelckpt_cfg["params"]["monitor"] = model.monitor
-            default_modelckpt_cfg["params"]["save_top_k"] = 3
-
-        if "modelcheckpoint" in lightning_config:
-            modelckpt_cfg = lightning_config.modelcheckpoint
-        else:
-            modelckpt_cfg =  OmegaConf.create()
-        modelckpt_cfg = OmegaConf.merge(default_modelckpt_cfg, modelckpt_cfg)
-        print(f"Merged modelckpt-cfg: \n{modelckpt_cfg}")
-        if version.parse(pl.__version__) < version.parse('1.4.0'):
-            trainer_kwargs["checkpoint_callback"] = instantiate_from_config(modelckpt_cfg)
-
-        # add callback which sets up log directory
-        default_callbacks_cfg = {
-            "setup_callback": {
-                "target": "main.SetupCallback",
-                "params": {
-                    "resume": opt.resume,
-                    "now": now,
-                    "logdir": logdir,
-                    "ckptdir": ckptdir,
-                    "cfgdir": cfgdir,
-                    "config": config,
-                    "lightning_config": lightning_config,
-                }
-            },
-            "image_logger": {
-                "target": "main.ImageLogger",
-                "params": {
-                    "batch_frequency": 750,
-                    "max_images": 4,
-                    "clamp": True
-                }
-            },
-            "learning_rate_logger": {
-                "target": "main.LearningRateMonitor",
-                "params": {
-                    "logging_interval": "step",
-                    # "log_momentum": True
-                }
-            },
-            "cuda_callback": {
-                "target": "main.CUDACallback"
-            },
-        }
-        if version.parse(pl.__version__) >= version.parse('1.4.0'):
-            default_callbacks_cfg.update({'checkpoint_callback': modelckpt_cfg})
-
-        if "callbacks" in lightning_config:
-            callbacks_cfg = lightning_config.callbacks
-        else:
-            callbacks_cfg = OmegaConf.create()
-
-        if 'metrics_over_trainsteps_checkpoint' in callbacks_cfg:
-            print(
-                'Caution: Saving checkpoints every n train steps without deleting. This might require some free space.')
-            default_metrics_over_trainsteps_ckpt_dict = {
-                'metrics_over_trainsteps_checkpoint':
-                    {"target": 'pytorch_lightning.callbacks.ModelCheckpoint',
-                     'params': {
-                         "dirpath": os.path.join(ckptdir, 'trainstep_checkpoints'),
-                         "filename": "{epoch:06}-{step:09}",
-                         "verbose": True,
-                         'save_top_k': -1,
-                         'every_n_train_steps': 10000,
-                         'save_weights_only': True
-                     }
-                     }
-            }
-            default_callbacks_cfg.update(default_metrics_over_trainsteps_ckpt_dict)
-
-        callbacks_cfg = OmegaConf.merge(default_callbacks_cfg, callbacks_cfg)
-        if 'ignore_keys_callback' in callbacks_cfg and hasattr(trainer_opt, 'resume_from_checkpoint'):
-            callbacks_cfg.ignore_keys_callback.params['ckpt_path'] = trainer_opt.resume_from_checkpoint
-        elif 'ignore_keys_callback' in callbacks_cfg:
-            del callbacks_cfg['ignore_keys_callback']
-
-        trainer_kwargs["callbacks"] = [instantiate_from_config(callbacks_cfg[k]) for k in callbacks_cfg]
-
-        trainer = Trainer.from_argparse_args(trainer_opt, **trainer_kwargs)
-        trainer.logdir = logdir  ###
+        trainer = get_trainer(cfgdir, ckptdir, config, lightning_config, logdir, model, now, nowname, opt, trainer_opt)
 
         # data
         data = instantiate_from_config(config.data)
@@ -692,7 +563,6 @@ if __name__ == "__main__":
             print("++++ NOT USING LR SCALING ++++")
             print(f"Setting learning rate to {model.learning_rate:.2e}")
 
-
         # allow checkpointing via USR1
         def melk(*args, **kwargs):
             # run all checkpoint hooks
@@ -701,12 +571,10 @@ if __name__ == "__main__":
                 ckpt_path = os.path.join(ckptdir, "last.ckpt")
                 trainer.save_checkpoint(ckpt_path)
 
-
         def divein(*args, **kwargs):
             if trainer.global_rank == 0:
                 import pudb;
                 pudb.set_trace()
-
 
         import signal
 
@@ -739,3 +607,178 @@ if __name__ == "__main__":
             os.rename(logdir, dst)
         if trainer.global_rank == 0:
             print(trainer.profiler.summary())
+
+
+def get_trainer(cfgdir, ckptdir, config, lightning_config, logdir, model, now, nowname, opt, trainer_opt):
+    trainer_kwargs = dict()
+    # default logger configs
+    logger_cfg = get_logger_cfg(lightning_config, logdir, nowname, opt)
+    trainer_kwargs["logger"] = instantiate_from_config(logger_cfg)
+    modelckpt_cfg = get_model_ckpt_cfg_2(ckptdir, lightning_config, model, trainer_kwargs)
+    callbacks_cfg = get_callbacks_cfg(cfgdir,
+                                      ckptdir,
+                                      config,
+                                      lightning_config,
+                                      logdir,
+                                      modelckpt_cfg,
+                                      now,
+                                      opt,
+                                      trainer_opt)
+    trainer_kwargs["callbacks"] = [instantiate_from_config(callbacks_cfg[k]) for k in callbacks_cfg]
+    trainer = Trainer.from_argparse_args(trainer_opt, **trainer_kwargs)
+    trainer.logdir = logdir  ###
+    return trainer
+
+
+def get_model_ckpt_cfg_2(ckptdir, lightning_config, model, trainer_kwargs):
+    # modelcheckpoint - use TrainResult/EvalResult(checkpoint_on=metric) to
+    # specify which metric is used to determine best models
+    modelckpt_cfg = get_model_ckpt_cfg_all(ckptdir, lightning_config, model)
+    print(f"Merged modelckpt-cfg: \n{modelckpt_cfg}")
+    if version.parse(pl.__version__) < version.parse('1.4.0'):
+        trainer_kwargs["checkpoint_callback"] = instantiate_from_config(modelckpt_cfg)
+    return modelckpt_cfg
+
+
+def get_lightning_trainer_cfg(config, opt):
+    lightning_config = config.pop("lightning", OmegaConf.create())
+    # merge trainer cli with config # omg this is a cyclic dependency
+    trainer_config = lightning_config.get("trainer", OmegaConf.create())
+    # default to ddp
+    trainer_config["accelerator"] = "ddp"
+    for k in nondefault_trainer_args(opt):
+        trainer_config[k] = getattr(opt, k)
+    if not "gpus" in trainer_config:
+        del trainer_config["accelerator"]
+        cpu = True
+    else:
+        gpuinfo = trainer_config["gpus"]
+        print(f"Running on GPUs {gpuinfo}")
+        cpu = False
+    trainer_opt = argparse.Namespace(**trainer_config)
+    lightning_config.trainer = trainer_config
+    return cpu, lightning_config, trainer_opt
+
+
+def get_logger_cfg(lightning_config, logdir, nowname, opt):
+    default_logger_cfgs = {
+        "wandb": {
+            "target": "pytorch_lightning.loggers.WandbLogger",
+            "params": {
+                "name": nowname,
+                "save_dir": logdir,
+                "offline": opt.debug,
+                "id": nowname,
+            }
+        },
+        "testtube": {
+            "target": "pytorch_lightning.loggers.TestTubeLogger",
+            "params": {
+                "name": "testtube",
+                "save_dir": logdir,
+            }
+        },
+    }
+    default_logger_cfg = default_logger_cfgs["testtube"]
+    if "logger" in lightning_config:
+        logger_cfg = lightning_config.logger
+    else:
+        logger_cfg = OmegaConf.create()
+    logger_cfg = OmegaConf.merge(default_logger_cfg, logger_cfg)
+    return logger_cfg
+
+
+def get_model_ckpt_cfg_all(ckptdir, lightning_config, model):
+    default_modelckpt_cfg = {
+        "target": "pytorch_lightning.callbacks.ModelCheckpoint",
+        "params": {
+            "dirpath": ckptdir,
+            "filename": "{epoch:06}",
+            "verbose": True,
+            "save_last": True,
+        }
+    }
+    if hasattr(model, "monitor"):
+        print(f"Monitoring {model.monitor} as checkpoint metric.")
+        default_modelckpt_cfg["params"]["monitor"] = model.monitor
+        default_modelckpt_cfg["params"]["save_top_k"] = 3
+    modelckpt_cfg = get_model_ckpt_cfg(default_modelckpt_cfg, lightning_config)
+    return modelckpt_cfg
+
+
+def get_model_ckpt_cfg(default_modelckpt_cfg, lightning_config):
+    if "modelcheckpoint" in lightning_config:
+        modelckpt_cfg = lightning_config.modelcheckpoint
+    else:
+        modelckpt_cfg = OmegaConf.create()
+    modelckpt_cfg = OmegaConf.merge(default_modelckpt_cfg, modelckpt_cfg)
+    return modelckpt_cfg
+
+
+def get_callbacks_cfg(cfgdir, ckptdir, config, lightning_config, logdir, modelckpt_cfg, now, opt, trainer_opt):
+    # add callback which sets up log directory
+    default_callbacks_cfg = {
+        "setup_callback": {
+            "target": "main.SetupCallback",
+            "params": {
+                "resume": opt.resume,
+                "now": now,
+                "logdir": logdir,
+                "ckptdir": ckptdir,
+                "cfgdir": cfgdir,
+                "config": config,
+                "lightning_config": lightning_config,
+            }
+        },
+        "image_logger": {
+            "target": "main.ImageLogger",
+            "params": {
+                "batch_frequency": 750,
+                "max_images": 4,
+                "clamp": True
+            }
+        },
+        "learning_rate_logger": {
+            "target": "main.LearningRateMonitor",
+            "params": {
+                "logging_interval": "step",
+                # "log_momentum": True
+            }
+        },
+        "cuda_callback": {
+            "target": "main.CUDACallback"
+        },
+    }
+    if version.parse(pl.__version__) >= version.parse('1.4.0'):
+        default_callbacks_cfg.update({'checkpoint_callback': modelckpt_cfg})
+    if "callbacks" in lightning_config:
+        callbacks_cfg = lightning_config.callbacks
+    else:
+        callbacks_cfg = OmegaConf.create()
+    if 'metrics_over_trainsteps_checkpoint' in callbacks_cfg:
+        print(
+            'Caution: Saving checkpoints every n train steps without deleting. This might require some free space.')
+        default_metrics_over_trainsteps_ckpt_dict = {
+            'metrics_over_trainsteps_checkpoint':
+                {"target": 'pytorch_lightning.callbacks.ModelCheckpoint',
+                 'params': {
+                     "dirpath": os.path.join(ckptdir, 'trainstep_checkpoints'),
+                     "filename": "{epoch:06}-{step:09}",
+                     "verbose": True,
+                     'save_top_k': -1,
+                     'every_n_train_steps': 10000,
+                     'save_weights_only': True
+                 }
+                 }
+        }
+        default_callbacks_cfg.update(default_metrics_over_trainsteps_ckpt_dict)
+    callbacks_cfg = OmegaConf.merge(default_callbacks_cfg, callbacks_cfg)
+    if 'ignore_keys_callback' in callbacks_cfg and hasattr(trainer_opt, 'resume_from_checkpoint'):
+        callbacks_cfg.ignore_keys_callback.params['ckpt_path'] = trainer_opt.resume_from_checkpoint
+    elif 'ignore_keys_callback' in callbacks_cfg:
+        del callbacks_cfg['ignore_keys_callback']
+    return callbacks_cfg
+
+
+if __name__ == "__main__":
+    main()

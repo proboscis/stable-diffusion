@@ -661,6 +661,8 @@ class LatentDiffusion(DDPM):
         z = self.get_first_stage_encoding(encoder_posterior).detach()
 
         if self.model.conditioning_key is not None:
+            # omg what a lot of switching for adding a condition.
+            # I would strongly suggest using strategy pattern here...
             if cond_key is None:
                 cond_key = self.cond_stage_key
             if cond_key != self.first_stage_key:
@@ -704,6 +706,7 @@ class LatentDiffusion(DDPM):
 
     @torch.no_grad()
     def decode_first_stage(self, z, predict_cids=False, force_not_quantize=False):
+        z = z.to(self.device)
         if predict_cids:
             if z.dim() == 4:
                 z = torch.argmax(z.exp(), dim=1).long()
@@ -717,7 +720,7 @@ class LatentDiffusion(DDPM):
                 ks = self.split_input_params["ks"]  # eg. (128, 128)
                 stride = self.split_input_params["stride"]  # eg. (64, 64)
                 uf = self.split_input_params["vqf"]
-                bs, nc, h, w = z.shape
+                bs, nc, h, w = z.shapettn
                 if ks[0] > h or ks[1] > w:
                     ks = (min(ks[0], h), min(ks[1], w))
                     print("reducing Kernel")
@@ -873,7 +876,7 @@ class LatentDiffusion(DDPM):
             assert c is not None
             if self.cond_stage_trainable:
                 c = self.get_learned_conditioning(c)
-            if self.shorten_cond_schedule:  # TODO: drop this option
+            if self.shorten_cond_schedule:  # TODO: drop this option # masui=> it is set to False
                 tc = self.cond_ids[t].to(self.device)
                 c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
         return self.p_losses(x, c, t, *args, **kwargs)
@@ -908,7 +911,6 @@ class LatentDiffusion(DDPM):
             h, w = x_noisy.shape[-2:]
 
             fold, unfold, normalization, weighting = self.get_fold_unfold(x_noisy, ks, stride)
-
             z = unfold(x_noisy)  # (bn, nc * prod(**ks), L)
             # Reshape to img shape
             z = z.view((z.shape[0], -1, ks[0], ks[1], z.shape[-1]))  # (bn, nc, ks[0], ks[1], L )
@@ -1036,6 +1038,7 @@ class LatentDiffusion(DDPM):
 
         loss = self.l_simple_weight * loss.mean()
 
+        # why is this calculated twice???
         loss_vlb = self.get_loss(model_output, target, mean=False).mean(dim=(1, 2, 3))
         loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
         loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
