@@ -441,11 +441,13 @@ class Txt2Img:
 
 def get_or_create_txt2img_env(remote_interpreter_factory: RemoteInterpreterFactory, name: str):
     rem = remote_interpreter_factory
+    import numpy as np
     opt = parse_args(["--plms"])
     env = rem.get_or_create(name, num_gpus=1)
     if "txt2img" not in env:
         txt2img = env.put(Txt2Img)(opt, False)
         txt2img = env.put_named("txt2img", txt2img)
+    #env.put(seed_everything)(np.random.randint(0,10000)).fetch()
     return env
 
 

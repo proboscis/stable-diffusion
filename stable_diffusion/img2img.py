@@ -455,7 +455,10 @@ def get_img2img_env(remote_interpreter_factory: RemoteInterpreterFactory, force_
 
 def get_annon_img2img_env(remote_interpreter_factory:RemoteInterpreterFactory):
     env = remote_interpreter_factory.create(num_gpus=1)
+    import numpy as np
+    seed = np.random.randint(0,10000)
     env["img2img_vars"] = env.put(serve_img2img)([])
+    #env.put(seed_everything)(seed).fetch()
     return env
 
 
