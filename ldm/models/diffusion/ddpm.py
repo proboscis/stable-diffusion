@@ -1446,3 +1446,14 @@ class Layout2ImgDiffusion(LatentDiffusion):
         cond_img = torch.stack(bbox_imgs, dim=0)
         logs['bbox_image'] = cond_img
         return logs
+
+class MergedDecoder(torch.nn.Module):
+    def __init__(self,decoder,scale,post_quant_conv):
+        super().__init__()
+        self.decoder=decoder
+        self.scale=scale
+        self.post_quant_conv = post_quant_conv
+
+    def forward(self,x):
+        x = self.decoder(self.post_quant_conv(x/self.scale))
+        return ((x + 1)/2).clamp(min=0.,max=1.)

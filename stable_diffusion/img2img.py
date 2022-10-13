@@ -2,7 +2,7 @@
 
 import argparse, os, sys, glob
 from dataclasses import dataclass
-from typing import Sequence, Iterator, Callable
+from typing import Sequence, Iterator, Callable, cast
 
 import PIL
 import torch
@@ -23,11 +23,12 @@ from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler,MyDDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
 from omni_converter import IAutoData
-from ray_remote_env.interface import IRemoteEnv
 from archpainter.ray_design import ray_design
-from ray_remote_env.remote_env import RemoteEnvManager
 
 from pinject_design import Design, Injected
+from pinject_design.di.graph import ExtendedObjectGraph
+from pinject_design.di.injected import InjectedFunction
+from ray_proxy import IRemoteInterpreter, RemoteInterpreterFactory, Var
 
 
 def chunk(it, size):
@@ -417,7 +418,8 @@ def serve_img2img(argv):
                 samples=x_samples
             )
 
-    from archpainter.tasks.harmonizers import StableDiffusionHarmonizer, DdimEncodingHistoryProvider
+    from archpainter.tasks.harmonizers import StableDiffusionHarmonizer
+    from archpainter.models.diffusion.ddim_encoding import DdimEncodingHistoryProvider
     design = Design(
         classes=[
             StableDiffusionHarmonizer,
@@ -438,23 +440,32 @@ def serve_img2img(argv):
     return {**globals(), **locals()}
 
 
-def get_img2img_env(remote_env_manager: RemoteEnvManager, force_create, name) -> IRemoteEnv:
+def get_img2img_env(remote_interpreter_factory: RemoteInterpreterFactory, force_create, name) -> IRemoteInterpreter:
     # rem: RemoteEnvManager = ray_design.to_graph()[RemoteEnvManager]
     # rem.destroy("img2img_env")
     if force_create:
-        remote_env_manager.destroy(name)
-        env = remote_env_manager.create(name=name, num_gpus=1)
-        # env = remote_env_manager.get_or_create("img2img_env", num_gpus=1)
+        remote_interpreter_factory.destroy(name)
+        env = remote_interpreter_factory.create(name=name, num_gpus=1)
+        # env = remote_interface_factory.get_or_create("img2img_env", num_gpus=1)
     else:
-        env = remote_env_manager.get(name)
+        env = remote_interpreter_factory.get(name)
     if not "img2img_vars" in env:
         env["img2img_vars"] = env.put(serve_img2img)([])
     return env
+
+def get_annon_img2img_env(remote_interpreter_factory:RemoteInterpreterFactory):
+    env = remote_interpreter_factory.create(num_gpus=1)
+    env["img2img_vars"] = env.put(serve_img2img)([])
+    return env
+
 
 
 img2img_env = Injected.bind(get_img2img_env,
                             force_create=Injected.pure(True),
                             name=Injected.pure("img2img_env"))
+annon_img2img_env = Injected.bind(get_annon_img2img_env)
+
+img2img_graph:Injected[Var[ExtendedObjectGraph]] = img2img_env.proxy["img2img_vars"]["graph"].eval()
 
 img2img_env_client = Injected.bind(get_img2img_env,
                                    force_create=Injected.pure(False),
@@ -462,7 +473,7 @@ img2img_env_client = Injected.bind(get_img2img_env,
 
 if __name__ == "__main__":
     # okey, I wanna be able to start this actor from the other places.
-    rem: RemoteEnvManager = ray_design.to_graph()[RemoteEnvManager]
+    rem: RemoteInterpreterFactory = ray_design.to_graph()[RemoteInterpreterFactory]
     rem.destroy("img2img_env")
     env = rem.get_or_create("img2img_env", num_gpus=1)
     env["img2img_vars"] = env.put(serve_img2img)([])

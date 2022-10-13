@@ -11,7 +11,7 @@ from archpainter.rulebook import auto, identify_image
 
 os.environ["RAY_PROFILING"] = "1"
 from archpainter.ray_design import ray_design
-from ray_remote_env.remote_env import RemoteEnvManager
+from ray_proxy.remote_env import RemoteEnvManager
 import torch
 rem: RemoteEnvManager = ray_design.provide(RemoteEnvManager)
 #%%

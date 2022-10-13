@@ -1,9 +1,12 @@
 import sys
 import ldm
+from archpainter.auto_image import AutoImage
 from archpainter.ray_design import ray_design
+from archpainter.rulebook import identify_image
 from pinject_design import Injected
+from ray_proxy import RemoteInterpreterFactory, IRemoteInterpreter, Var
 
-print(f"python path=>{sys.path}")
+#print(f"python path=>{sys.path}")
 import argparse
 
 import os
@@ -29,8 +32,6 @@ from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler, PLMSConfig
 from ldm.util import instantiate_from_config
 import ray
-
-from ray_remote_env.remote_env import RemoteEnvManager
 
 
 # load safety model
@@ -313,13 +314,13 @@ class Txt2Img:
                     self.save_grid(grid_image)
                     return grid_image
 
-    def generate_samples(self,prompt:str,n_samples=None, start_code=None, width=None,height=None):
+    def generate_samples(self, prompt: str, n_samples=None, start_code=None, width=None, height=None):
         n_samples = n_samples or self.batch_size
         prompt = [prompt] * n_samples
         with self.generation_cxt():
             all_samples = list()
             for n in trange(self.opt.n_iter, desc="Sampling"):
-                images_torch = self.generate_from_prompt(prompt, start_code,width=width,height=height)
+                images_torch = self.generate_from_prompt(prompt, start_code, width=width, height=height)
                 for x_sample in images_torch:
                     sample_img = self.sample_to_img(x_sample)
                     self.save_sample(sample_img)
@@ -438,8 +439,8 @@ class Txt2Img:
         return f"Txt2Img"
 
 
-def get_or_create_txt2img_env(remote_env_manager: RemoteEnvManager, name: str):
-    rem = remote_env_manager
+def get_or_create_txt2img_env(remote_interpreter_factory: RemoteInterpreterFactory, name: str):
+    rem = remote_interpreter_factory
     opt = parse_args(["--plms"])
     env = rem.get_or_create(name, num_gpus=1)
     if "txt2img" not in env:
@@ -453,9 +454,27 @@ txt2img_env = Injected.bind(
     name=Injected.pure("txt2img_env")
 )
 
+
+@dataclass
+class RemoteTextToImage:
+    env: IRemoteInterpreter
+
+    def __post_init__(self):
+        self.txt2img: Txt2Img = self.env["txt2img"]
+
+    def generate_samples(self, prompt, n_samples=1, width=1536, height=384) -> Var:
+        return self.txt2img.generate_samples(prompt=prompt, n_samples=n_samples, width=width, height=height)
+
+    def generate_auto_samples(self, prompt, n_samples=1, width=512, height=512) -> AutoImage:
+        samples = self.generate_samples(prompt, n_samples, width, height)
+        return AutoImage(identify_image(samples.fetch()))
+
+
+remote_txt2img: Injected[RemoteTextToImage] = txt2img_env.map(lambda e: RemoteTextToImage(e))
+
 if __name__ == "__main__":
-    rem: RemoteEnvManager = ray_design.bind_instance(
-    ).provide(RemoteEnvManager)
+    rem: RemoteInterpreterFactory = ray_design.bind_instance(
+    ).provide(RemoteInterpreterFactory)
     opt = parse_args(sys.argv[1:])
     rem.destroy("txt2img_env")
     rem.destroy("txt2img_env2")

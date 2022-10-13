@@ -1,5 +1,5 @@
 from archpainter import find_cfg_by_alias
-from ray_remote_env.remote_env import RemoteEnvManager
+from ray_proxy.remote_env import RemoteEnvManager
 
 cfg = find_cfg_by_alias("l2r_palette") +dict(
     job_type="waifu_diffusion"

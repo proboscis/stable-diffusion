@@ -4,8 +4,10 @@ from archpainter.rulebook import identify_image
 
 from stable_diffusion.txt2img import txt2img_env
 
+
 env = ray_design.bind_instance(host="mac").provide(txt2img_env)
 # BEWARE: start txt2img actor by using txt2img.py.
+
 txt2img = env["txt2img"]
 from matplotlib import pyplot as plt
 
@@ -36,7 +38,7 @@ prompt = "a sister praying in a beautiful mosk, lit by shiny sunlight"
 prompt = "Shizuoka prefecture, under heavy flood"
 prompt = "Shizuoka prefecture"
 prompt = "Kanagawa prefecture"
-prompt = "Machida"
+prompt = "A logo with one character 'A'"
 img = txt2img.generate_samples(prompt,n_samples=1,width=1536,height=384).fetch()
 imgs = identify_image(img)
 imgs.value
