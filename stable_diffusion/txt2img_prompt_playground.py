@@ -1,16 +1,34 @@
+from pytorch_lightning import seed_everything
+
+from archpainter.auto_image import append_imgs
+from archpainter.experiments.config.root_cfg import ROOT_CFG
 from archpainter.experiments.tools.nrm_editor_views import show_image
 from archpainter.ray_design import ray_design
+from archpainter.ray_util.cluster_design import cluster_design
 from archpainter.rulebook import identify_image
+from data_tree.util import ensure_path_exists
+from pinject_design import Design, injected_factory
 
-from stable_diffusion.txt2img import txt2img_env
+from stable_diffusion.txt2img import txt2img_env, RemoteTextToImage
 
-
-env = ray_design.bind_instance(host="mac").provide(txt2img_env)
-# BEWARE: start txt2img actor by using txt2img.py.
-
-txt2img = env["txt2img"]
+#%%
+g = (ROOT_CFG + Design().bind_instance(
+    scheduler_design = cluster_design.bind_provider(
+    ).override_issuable(
+        gpu_env=4,
+        txt2img_env=1,
+        txt2img=1,
+        img2img_env=1,
+    )
+).bind_provider(
+    sch = lambda scheduler_design,ray:scheduler_design.to_scheduler()
+)).to_cfg().exp_graph()
 from matplotlib import pyplot as plt
-
+sch = g["sch"]
+#%%
+with sch["txt2img":1] as txtimgs:
+    for i,t in enumerate([txtimgs]):
+        t.env.put(seed_everything)(i)
 #%%
 prompt = "beautiful concept art of a landscape in Japan"
 prompt = "beautiful concept art of armored core in battlefield"
@@ -38,8 +56,30 @@ prompt = "a sister praying in a beautiful mosk, lit by shiny sunlight"
 prompt = "Shizuoka prefecture, under heavy flood"
 prompt = "Shizuoka prefecture"
 prompt = "Kanagawa prefecture"
-prompt = "A logo with one character 'A'"
-img = txt2img.generate_samples(prompt,n_samples=1,width=1536,height=384).fetch()
+prompt = "a photo of a face of a confused male scientist"
+prompt = "a goat painted by Gogh"
+prompt = "pile of tomatoes and marbles on the floor"
+import ray
+@ray.remote
+def r_txt2img(**kwargs):
+    with sch["txt2img"] as t:
+        return t.generate_samples(**kwargs)
+
+img = [r_txt2img.remote(prompt=prompt,n_samples=1,width=512,height=512) for i in range(1)]
+append_imgs(img).show_plot()
+for i,_img in enumerate(append_imgs(img).to("[image,RGB,RGB]")):
+    path = f"free_images/sd/{prompt}_{i}".replace(" ","_") + ".png"
+    ensure_path_exists(path)
+    print(path)
+    _img.save(path)
+#%%
+%cd /Users/kento/repos/archpainter
+#%%
+#%%
+#%%
+append_imgs(img).to("[image,RGB,RGB]")
+#%%
+#img = txt2img.generate_samples(prompt,n_samples=1,width=1536,height=384).fetch()
 imgs = identify_image(img)
 imgs.value
 plt.figure(figsize=(24,12))
