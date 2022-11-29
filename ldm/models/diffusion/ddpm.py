@@ -273,6 +273,11 @@ class DDPM(pl.LightningModule):
 
     def q_sample(self, x_start, t, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
+        # sqrt(alpha) * x0 + sqrt(1-alpha)*noise
+        # and the model needs to predict noise from this.
+        # and this is the same as trying to make the model predict all the noise from beginning to step t.
+        # because the model needs to predict a noise from largely noised image.
+        # anyways, the question is why we can't revert this process by tracking the noise we combined.
         return (extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
                 extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise)
 
@@ -704,6 +709,8 @@ class LatentDiffusion(DDPM):
             out.append(xc)
         return out
 
+
+
     @torch.no_grad()
     def decode_first_stage(self, z, predict_cids=False, force_not_quantize=False):
         z = z.to(self.device)
@@ -1012,6 +1019,10 @@ class LatentDiffusion(DDPM):
         return mean_flat(kl_prior) / np.log(2.0)
 
     def p_losses(self, x_start, cond, t, noise=None):
+        # I need to figure out whether the model is trained to
+        # predict the cumulative noise or the one step noise.
+        # either case it is gaussian though...
+        # so, how is this noise used to get the x_noisy?
         noise = default(noise, lambda: torch.randn_like(x_start))
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
         model_output = self.apply_model(x_noisy, t, cond)
